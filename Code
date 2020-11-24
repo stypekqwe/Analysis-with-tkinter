@@ -1,0 +1,138 @@
+import tkinter as tk
+from tkinter import filedialog
+import pandas as pd
+from tkinter.filedialog import asksaveasfilename
+
+#Control Panel
+upper_thresh = 1.75  # Notes will distinguish incumbents having comp higher than upper_thresh times mean
+lower_thresh = 0.5  # Notes will distinguish incumbents having comp lower than upper_thresh times mean
+sample_thresh = 6  # Threshold controlling the sample size which returns comment "small sample"
+
+# Disable a warning pertaining to chain-linked assignments: irrelevant for the scope of this tool
+pd.set_option('mode.chained_assignment', None)
+
+# Note: "|" is equivalent to "or"
+# Initialize Tkinter window pop-up module
+root = tk.Tk()
+root.withdraw()
+
+# Grab summary and raw data files
+summary_path = filedialog.askopenfile(filetypes=[('.csvfiles', '.csv')], title='Select Summary File')
+raw_data_path = filedialog.askopenfile(filetypes=[('.csvfiles', '.csv')], title='Select Raw Data File')
+
+summary_file = pd.read_csv(summary_path, ",")
+raw_data_file = pd.read_csv(raw_data_path, ",")
+
+# Remove 9999 row and isds from the summary file
+badrow = summary_file[summary_file["Job #"] == 9999].index | summary_file[summary_file["# of Orgs"] < 5].index
+summary_file.drop(badrow, inplace=True)
+
+# Run the outlier check
+base_selector = ((summary_file["Base Salary 25th"] > summary_file["Base Salary Mean"]) |
+                 (summary_file["Base Salary Mean"] > summary_file["Base Salary 75th"]) |
+                 (summary_file["Base Salary 75th"] > summary_file["Base Salary 90th"]))
+
+tcc_selector = ((summary_file["Total Cash Compensation 25th"] > summary_file["Total Cash Compensation Mean"]) |
+                (summary_file["Total Cash Compensation Mean"] > summary_file["Total Cash Compensation 75th"]) |
+                (summary_file["Total Cash Compensation 75th"] > summary_file["Total Cash Compensation 90th"]))
+
+tdc_selector = ((summary_file["Total Direct Compensation 25th"] > summary_file["Total Direct Compensation Mean"]) |
+                (summary_file["Total Direct Compensation Mean"] > summary_file["Total Direct Compensation 75th"]) |
+                (summary_file["Total Direct Compensation 75th"] > summary_file["Total Direct Compensation 90th"]))
+
+# Combine the above to arrive at jobs to review in raw data file
+outliers = base_selector | tcc_selector | tdc_selector
+
+# Find the comp type with biggest skews
+temp = summary_file[outliers]
+temp["base_25"] = temp["Base Salary 25th"] - temp["Base Salary Mean"]
+temp['base_75'] = temp["Base Salary Mean"] - temp["Base Salary 75th"]
+temp['base_90'] = temp["Base Salary 75th"] - temp["Base Salary 90th"]
+temp['base_diff'] = temp[["base_25", "base_75", "base_90"]].max(axis=1)
+
+temp["tcc_25"] = temp["Total Cash Compensation 25th"] - temp["Total Cash Compensation Mean"]
+temp["tcc_75"] = temp["Total Cash Compensation Mean"] - temp["Total Cash Compensation 75th"]
+temp["tcc_90"] = temp["Total Cash Compensation 75th"] - temp["Total Cash Compensation 90th"]
+temp["tcc_diff"] = temp[['tcc_25', 'tcc_75', 'tcc_90']].max(axis=1)
+
+temp['tdc_25'] = temp["Total Direct Compensation 25th"] - temp["Total Direct Compensation Mean"]
+temp['tdc_75'] = temp["Total Direct Compensation Mean"] - temp["Total Direct Compensation 75th"]
+temp['tdc_90'] = temp["Total Direct Compensation 75th"] - temp["Total Direct Compensation 90th"]
+temp["tdc_diff"] = temp[['tdc_25', 'tdc_75', 'tdc_90']].max(axis=1)
+
+# Create a new column in temporary table to hold primary comp type that is skewed
+temp["biggest_diff"] = "placeholder"
+for number in temp.index:
+    if (temp.loc[number, 'base_diff'] > temp.loc[number, "tcc_diff"]) & (temp.loc[number, 'base_diff'] > temp.loc[number, "tdc_diff"]):
+        temp.loc[number, "biggest_diff"] = "base"
+    elif temp.loc[number, "tcc_diff"] > temp.loc[number, "tdc_diff"]:
+        temp.loc[number, "biggest_diff"] = "tcc"
+    else:
+        temp.loc[number, "biggest_diff"] = "tdc"
+
+# Small DataFrame holding jobs and their biggest differences (base, tcc or tdc)
+jobs = temp[['Job #', 'biggest_diff']]
+
+# Filter out redundant rows raw data:
+raw_data_file = raw_data_file[raw_data_file["Survey_Job_Code"].isin(jobs['Job #'])]
+badrow = raw_data_file[raw_data_file.AVERAGED_RECORD.isnull()].index
+raw_data_file.drop(badrow, inplace=True)
+
+# Join raw data file on jobs DataFrame to create 'job to biggest_diff' link
+raw_data_file = raw_data_file.merge(jobs, how='left', left_on='Survey_Job_Code', right_on='Job #')
+
+# Initialize new columns. Although normally, it would not be needed, the way we reference the table requires all columns
+# to already exist when we reference them for the first time
+raw_data_file["times_x"] = 0
+raw_data_file["temp_col"] = 0
+raw_data_file["Notes_Outliers"] = '#'
+
+# Iterate through all jobs
+for job in jobs["Job #"]:
+    comp_type = jobs[["biggest_diff"]][(jobs["Job #"] == job)]
+    job_slice = raw_data_file.Survey_Job_Code == job
+    if comp_type.iloc[0][0] == "base":
+        mean = raw_data_file[["Base_Salary"]][job_slice].mean()
+        raw_data_file["temp_col"] = raw_data_file[["Base_Salary"]].apply(lambda x: x / mean.iloc[0])
+        raw_data_file["times_x"][job_slice] = raw_data_file["temp_col"][job_slice].round(2)
+    elif comp_type.iloc[0][0] == "tcc":
+        mean = raw_data_file[["Total_Cash_Compensation"]][job_slice].mean()
+        raw_data_file["temp_col"] = raw_data_file[["Total_Cash_Compensation"]].apply(lambda x: x / mean.iloc[0])
+        raw_data_file["times_x"][job_slice] = raw_data_file["temp_col"][job_slice].round(2)
+    else:
+        mean = raw_data_file[["TDC_(Cash_Only_Paid)"]][job_slice].mean()
+        raw_data_file["temp_col"] = raw_data_file[["TDC_(Cash_Only_Paid)"]].apply(lambda x: x / mean.iloc[0])
+        raw_data_file["times_x"][job_slice] = raw_data_file["temp_col"][job_slice].round(2)
+    # Create Outlier Notes
+    # High outliers:
+    selector = ((raw_data_file["times_x"] > upper_thresh) & (raw_data_file['times_x'][job_slice]))
+    raw_data_file['Notes_Outliers'][selector] = raw_data_file['Organization_Name'] + ' incumbent earns ' \
+                                                + raw_data_file['biggest_diff'] + ' ' + raw_data_file["times_x"].astype(str) \
+                                                + "x higher than average. "
+    # Low outliers:
+    selector = ((raw_data_file["times_x"] < lower_thresh) & (raw_data_file['times_x'][job_slice]))
+    raw_data_file['Notes_Outliers'][selector] = raw_data_file['Organization_Name'] + ' incumbent earns ' \
+                                                + raw_data_file['biggest_diff'] + ' ' + raw_data_file["times_x"].astype(str) \
+                                                + "x lower than average. "
+
+# Combine Outlier Notes into a single string
+# see if instead of selector, you can immediately update the main DF ------------------------------------------------------
+selector = raw_data_file.groupby(['Job #'])['Notes_Outliers'].apply(','.join)
+raw_data_file = raw_data_file.merge(selector, how='left', left_on='Job #', right_on='Job #')
+raw_data_file.Notes_Outliers_y = raw_data_file.Notes_Outliers_y.str.replace(',#', '')
+
+# Add a sentence about small sample size
+raw_data_file = raw_data_file.merge(temp.loc[:, ['Job #', '# of Orgs']], how='left', left_on='Survey_Job_Code', right_on='Job #')
+raw_data_file['Notes_Outliers_y'][raw_data_file['# of Orgs'] < sample_thresh] = "Small sample. " + \
+                                                                                raw_data_file['Notes_Outliers_y']
+
+
+# Drop unnecessary columns
+raw_data_file = raw_data_file[['Notes_Outliers_y', 'Incumbent_ID', 'Organization_ID', 'Organization_Name',
+                              'Survey_Job_Title', 'Survey_Job_Code', 'MD', 'Base_Salary', 'STI_Award_Paid',
+                              'Total_Cash_Compensation', 'LTI_Award_Paid_Annualized', 'TDC_(Cash_Only_Paid)']]
+raw_data_file = raw_data_file.rename(columns={'Notes_Outliers_y': 'Notes_Outliers'})
+
+#The end: ask user to specify a folder and use that filepath to save the outlier check output file
+save_file = asksaveasfilename(filetypes=(("Excel files", "*.xlsx"), ("All files", "*.*") ))
+raw_data_file.to_excel(save_file + ".xlsx", index=False, sheet_name="Results")
